@@ -1,0 +1,458 @@
+# ================================
+# 📌 Step 1: Load Required Libraries
+# ================================
+library(kohonen)       # Self-Organizing Maps (SOM)
+library(raster)        # Spatial raster operations
+library(sf)            # Spatial vector handling
+library(sp)            # Spatial analysis
+library(ggplot2)       # Visualization
+library(dplyr)         # Data manipulation
+library(randomForest)  # Pseudo-absence selection support
+library(spatstat)      # For spatial sampling
+library(FNN)           # For environmental similarity calculation
+library(pROC)          # Model validation with ROC-AUC
+
+# ================================
+# 📌 Step 2: Load & Prepare Data
+# ================================
+# Load Lassa fever dataset
+cases <- read.csv("/Users/kagboka/Desktop/Lassa modelling/Excels/Lassa fever Extraction.csv")  # Update path
+
+# Convert to spatial format using columns "Longitude" and "Latitude"
+cases_sf <- st_as_sf(cases, coords = c("Longitude", "Latitude"), crs = 4326)
+
+# Define presence & true absence (Incidence > 0 = presence)
+cases_sf$presence <- ifelse(cases_sf$Incidence > 0, 1, 0)
+
+# Separate presence & true absence data
+presence_sf <- cases_sf %>% filter(presence == 1)
+true_absence_sf <- cases_sf %>% filter(presence == 0)
+
+# Load environmental predictors
+suitability_raster <- raster("/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Historical model/Lassa_ensemble.tif")
+settlement_raster  <- raster("/Users/kagboka/Desktop/Lassa modelling/NDBI/NDBI_1990_2005.tif")
+
+# Project rasters to match case locations' CRS
+suitability_raster <- projectRaster(suitability_raster, crs = st_crs(cases_sf)$proj4string)
+settlement_raster  <- projectRaster(settlement_raster, crs = st_crs(cases_sf)$proj4string)
+
+# Stack predictors (assumed order: lyr1 = suitability, NDBI = settlement index)
+env_stack <- stack(suitability_raster, settlement_raster)
+
+# ================================
+# 📌 Step 3: Generate Pseudo-Absences & Merge with True Absences
+# ================================
+# Extract environmental data for presence locations
+presence_env <- extract(env_stack, presence_sf)
+presence_env <- as.data.frame(presence_env)
+presence_env <- na.omit(presence_env)
+
+# Sample random background points
+set.seed(123)
+background_points <- sampleRandom(env_stack, size = 1000, na.rm = TRUE, sp = TRUE, xy = TRUE)
+background_df <- as.data.frame(background_points)
+
+# Rename background columns to match presence_env (assumed: "lyr1" and "NDBI")
+colnames(background_df) <- colnames(presence_env)
+background_df <- background_df[, !is.na(colnames(background_df))]
+background_df <- background_df[, colnames(presence_env)]
+background_df <- na.omit(background_df)
+
+# Debug: Print column names
+cat("Presence Data Columns:\n")
+print(colnames(presence_env))
+cat("Background Data Columns:\n")
+print(colnames(background_df))
+
+if (ncol(presence_env) != ncol(background_df)) {
+  stop("Error: Presence and background datasets have different numbers of columns!")
+}
+
+if (nrow(presence_env) > 0 & nrow(background_df) > 0) {
+  pseudo_absences <- get.knnx(presence_env, background_df, k = 1)$nn.dist
+  background_df$pseudo <- ifelse(pseudo_absences > 0.2, 1, 0)
+  pseudo_indices <- which(background_df$pseudo == 1)
+  pseudo_sf <- background_points[pseudo_indices, ]
+} else {
+  stop("Error: No valid presence or background data after removing NAs")
+}
+
+# Extract environmental data for each group
+presence_df <- as.data.frame(extract(env_stack, presence_sf)); presence_df <- na.omit(presence_df); presence_df$presence <- 1
+pseudo_df   <- as.data.frame(extract(env_stack, pseudo_sf));   pseudo_df   <- na.omit(pseudo_df);   pseudo_df$presence <- 0
+true_absence_df <- as.data.frame(extract(env_stack, true_absence_sf)); true_absence_df <- na.omit(true_absence_df); true_absence_df$presence <- 0
+
+# Merge all datasets
+training_data <- rbind(presence_df, pseudo_df, true_absence_df)
+
+# ================================
+# 📌 Step 4: Normalize Training Data for SOM
+# ================================
+# Our predictor columns are "lyr1" and "NDBI"
+predictor_columns <- c("lyr1", "NDBI")
+if (!all(predictor_columns %in% colnames(training_data))) {
+  stop("Error: Missing predictor columns in training_data!")
+}
+training_data_scaled <- scale(training_data[, predictor_columns])
+cat("Summary of Scaled Training Data:\n")
+print(summary(training_data_scaled))
+
+# ================================
+# 📌 Step 5: Train SOM Model (Fine-Tuned)
+# ================================
+som_grid <- somgrid(xdim = 12, ydim = 12, topo = "hexagonal")
+set.seed(123)
+som_model <- som(training_data_scaled, grid = som_grid, rlen = 150, alpha = c(0.05, 0.01))
+saveRDS(som_model, "som_lassa_model.rds")
+cat("SOM Model Trained\n")
+
+# ================================
+# 📌 Step 6: Cluster Risk Zones
+# ================================
+som_clusters <- cutree(hclust(dist(som_model$codes[[1]])), k = 3)
+training_data$cluster <- som_clusters[som_model$unit.classif]
+cat("Cluster Distribution:\n")
+print(table(training_data$cluster))
+plot(som_model, type = "mapping", bgcol = terrain.colors(3)[som_clusters], main = "SOM Risk Clusters")
+legend("topright", legend = c("Low Risk", "Medium Risk", "High Risk"), fill = terrain.colors(3))
+
+# ================================
+# 📌 Step 7: Predict Risk Map Using SOM Codebook (Rule-Based ANN Approach)
+# ================================
+
+# Extract predictor values for all cells from the environmental stack
+env_values <- getValues(env_stack)  # Columns should correspond to "lyr1" and "NDBI"
+
+# Identify which cells have complete data (non-NA)
+complete_idx <- complete.cases(env_values)
+
+# For cells with complete data, normalize using the same parameters as training_data_scaled
+env_values_scaled <- matrix(NA, nrow = nrow(env_values), ncol = ncol(env_values))
+env_values_scaled[complete_idx, ] <- scale(env_values[complete_idx, ],
+                                           center = attr(training_data_scaled, "scaled:center"),
+                                           scale  = attr(training_data_scaled, "scaled:scale"))
+
+# Extract the SOM codebook vectors (learned prototypes)
+codebook <- som_model$codes[[1]]  # Each row is a prototype in scaled space
+
+# Use the nearest neighbor approach to assign each cell to a SOM node.
+# For cells with complete data, get the nearest codebook vector.
+library(FNN)
+nn <- get.knnx(data = codebook, query = env_values_scaled[complete_idx, ], k = 1)$nn.index
+
+# som_clusters holds the final cluster labels for each SOM node (obtained in Step 6)
+# Map each cell's nearest neuron to its corresponding risk cluster.
+cell_clusters <- rep(NA, nrow(env_values))
+cell_clusters[complete_idx] <- som_clusters[nn]
+
+# Create a new raster for the predicted risk map using the suitability raster as a template.
+risk_raster_present <- raster(suitability_raster)
+values(risk_raster_present) <- cell_clusters  # Assign cluster labels to cells
+
+# Optionally, you may smooth or interpolate missing cells if needed.
+# Here, we'll use a focal filter with a 3x3 window to fill small gaps.
+risk_raster_present <- focal(risk_raster_present, w = matrix(1, 3, 3), fun = function(x) {
+  # Remove NA values
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  # Return the most frequent (mode) cluster value in the window.
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+})
+
+# Define the directory (use the same directory as your data)
+data_directory <- "/Users/kagboka/Desktop/Lassa modelling/"
+risk_raster_path <- file.path(data_directory, "lassa_risk_present.tif")
+
+# Save the risk map as a GeoTIFF
+writeRaster(risk_raster_present, filename = risk_raster_path, format = "GTiff", overwrite = TRUE)
+
+# Confirm that the file is saved
+if (file.exists(risk_raster_path)) {
+  cat("Risk map successfully saved at:", risk_raster_path, "\n")
+} else {
+  cat("Error: Risk map was not saved correctly!\n")
+}
+
+# Visualize the risk raster
+plot(risk_raster_present, main = "Lassa Fever Risk Map (Predicted via SOM Codebook)")
+###########################
+# ================================
+# 📌 Step 8: Evaluate SOM Clustering Quality
+# ================================
+library(cluster)      # For silhouette
+library(clusterSim)   # For Davies-Bouldin index (install if necessary)
+
+# 8.1: Quantization Error
+quant_error <- mean(sqrt(rowSums((training_data_scaled - som_model$codes[[1]][som_model$unit.classif, ])^2)))
+cat("Quantization Error:", quant_error, "\n")
+
+# 8.2: Topographic Error
+# For each sample, get the 2 nearest BMUs in the codebook and check if they are adjacent in the SOM grid.
+knn_result <- get.knnx(data = som_model$codes[[1]], query = training_data_scaled, k = 2)$nn.index
+bmu <- knn_result[, 1]
+second_bmu <- knn_result[, 2]
+grid_pts <- som_model$grid$pts  # Grid coordinates of SOM nodes
+distances <- sqrt(rowSums((grid_pts[bmu,] - grid_pts[second_bmu,])^2))
+topo_error <- mean(distances > 1.5)  # Adjust threshold as needed (for a hexagonal grid)
+cat("Topographic Error:", topo_error, "\n")
+
+# 8.3: Silhouette Score
+sil <- silhouette(som_model$unit.classif, dist(training_data_scaled))
+avg_silhouette <- mean(sil[, 3])
+cat("Average Silhouette Score:", avg_silhouette, "\n")
+plot(sil, main = "Silhouette Plot for SOM Clusters")
+
+# 8.4: Davies-Bouldin Index (using clusterSim)
+db_index <- index.DB(training_data_scaled, som_model$unit.classif)$DB
+cat("Davies-Bouldin Index:", db_index, "\n")
+
+# 8.5: Visualize Cluster Size Distribution
+barplot(table(som_model$unit.classif), main = "Cluster Size Distribution", col = "skyblue")
+# ================================
+# 📌 Step 9: Predict  and Validate
+# ================================
+
+# --- Scenario 1: Validate Present-Day Model with Future Validation Data ---
+
+# Load future validation data (assumed to contain "Longitude", "Latitude", and "presence")
+future_validation <- read.csv("/Users/kagboka/Desktop/Lassa modelling/Excels/Validation_records.csv")  # Update path
+future_validation <- read.csv("/Users/kagboka/Desktop/Lassa modelling/Excels/Lassa fever Extraction.csv")  # Update path
+future_validation_sf <- st_as_sf(future_validation, coords = c("Longitude", "Latitude"), crs = 4326)
+future_validation_sf <- st_transform(future_validation_sf, crs = st_crs(cases_sf)$proj4string)
+
+# Extract predicted risk values from the present-day risk raster for validation points
+validation_risk <- extract(risk_raster_present, future_validation_sf)
+
+# Define high-risk threshold (e.g., cluster label 3 is considered high risk)
+high_risk_threshold <- 2
+
+# Compute proportion of validation points in high-risk areas
+high_risk_count <- sum(validation_risk >= high_risk_threshold, na.rm = TRUE)
+total_validation_points <- nrow(future_validation_sf)
+scenario1_accuracy <- high_risk_count / total_validation_points
+
+cat("Validation Points in High Risk:", high_risk_count, "\n")
+cat("Total Validation Points:", total_validation_points, "\n")
+cat("Scenario 1 Accuracy (Proportion in High Risk):", scenario1_accuracy, "\n")
+
+# Overlay validation points on the risk map
+plot(risk_raster_present, main = "Scenario 1: Present-Day Risk with Validation Points")
+plot(future_validation_sf, add = TRUE, col = "blue", pch = 16)
+legend("topright", legend = c("Validation Points"), col = "blue", pch = 16)
+
+# ================================
+# 📌 Step 9: Predict Future Risk Map Using SOM Rules (Custom Predict Function)
+# ================================
+
+# Define a custom prediction function for the SOM rule‐based model
+predict_som <- function(newdata, som_model, center_vals, scale_vals, som_clusters) {
+  # newdata: a matrix or data frame of new predictor values (columns "lyr1" and "NDBI")
+  # center_vals, scale_vals: scaling parameters from the training data (attributes of training_data_scaled)
+  # som_clusters: a vector mapping each SOM node (row of the codebook) to a risk cluster
+  
+  # Normalize the new data using the training parameters
+  newdata_scaled <- scale(newdata, center = center_vals, scale = scale_vals)
+  
+  # Use the nearest neighbor search (FNN) to assign each row to a SOM codebook vector
+  library(FNN)
+  nn_result <- get.knnx(data = som_model$codes[[1]], query = newdata_scaled, k = 1)$nn.index
+  
+  # Map the nearest SOM node to its risk cluster
+  predicted_clusters <- som_clusters[nn_result]
+  
+  return(predicted_clusters)
+}
+
+# ---- 9.1: Load present Environmental Predictors ----
+# (Replace these file paths with your present scenario files)
+future_suitability <- raster("/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Validation model/Lassa_ensemble_2014_2022.tif")
+future_settlement  <- raster("/Users/kagboka/Desktop/Lassa modelling/NDBI/NDBI_2014_2022.tif")
+
+# Project future rasters to match the CRS of your cases
+future_suitability <- projectRaster(future_suitability, crs = st_crs(cases_sf)$proj4string)
+future_settlement  <- projectRaster(future_settlement, crs = st_crs(cases_sf)$proj4string)
+future_settlement<-resample(future_settlement,future_suitability)
+# ---- 9.2: Stack Future Predictors and Extract Values ----
+future_stack <- stack(future_suitability, future_settlement)
+
+future_values <- getValues(future_stack)
+colnames(future_values) <- c("lyr1", "NDBI")  # Ensure these names match the training predictors
+
+# ---- 9.3: Normalize Future Data and Predict Risk Clusters ----
+complete_idx <- complete.cases(future_values)  # Identify cells with complete data
+# Initialize a vector for predictions
+future_predictions <- rep(NA, nrow(future_values))
+# Predict for complete cases using the custom predict function
+future_predictions[complete_idx] <- predict_som(
+  newdata = future_values[complete_idx, ],
+  som_model = som_model,
+  center_vals = attr(training_data_scaled, "scaled:center"),
+  scale_vals  = attr(training_data_scaled, "scaled:scale"),
+  som_clusters = som_clusters
+)
+
+# ---- 9.4: Create a Future Risk Map Raster ----
+risk_raster_future <- raster(future_stack[[1]])
+values(risk_raster_future) <- future_predictions
+
+# Optional: Apply smoothing using focal() if desired (see Step 7 for an example)
+
+# ---- 9.5: Save the Future Risk Map ----
+future_raster_path <- file.path(data_directory, "lassa_risk_future.tif")
+writeRaster(risk_raster_future, filename = future_raster_path, format = "GTiff", overwrite = TRUE)
+if (file.exists(future_raster_path)) {
+  cat("Future risk map successfully saved at:", future_raster_path, "\n")
+} else {
+  cat("Error: Future risk map was not saved correctly!\n")
+}
+
+# ---- 9.6: Visualize the Future Risk Map ----
+plot(risk_raster_future, main = "Midlle Lassa Fever Risk Map (Predicted via SOM Rules)")
+
+# ---- 9.7: Validate Future Scenario (Overlay Validation Data) ----
+# Load future validation data (assumes columns "Longitude", "Latitude", and "presence")
+future_validation <- read.csv("/Users/kagboka/Desktop/Lassa modelling/Excels/Validation_records.csv")  # Update path as needed
+future_validation_sf <- st_as_sf(future_validation, coords = c("Longitude", "Latitude"), crs = 4326)
+future_validation_sf <- st_transform(future_validation_sf, crs = st_crs(cases_sf)$proj4string)
+
+# Extract predicted risk values from the future risk map for the validation points
+future_val_risk <- extract(risk_raster_future, future_validation_sf)
+
+# Define a threshold for high risk (e.g., assume cluster "3" represents high risk)
+high_risk_threshold <- 2
+future_high_count <- sum(future_val_risk >= high_risk_threshold, na.rm = TRUE)
+total_future_val <- nrow(future_validation_sf)
+future_accuracy <- future_high_count / total_future_val
+
+cat("Future Validation Points in High Risk:", future_high_count, "\n")
+cat("Total Future Validation Points:", total_future_val, "\n")
+cat("Scenario 1 (Future Validation) Accuracy (High Risk Proportion):", future_accuracy, "\n")
+
+# Overlay future validation points on the future risk map for visual inspection
+plot(risk_raster_future, main = "Future Risk Map with Validation Points")
+plot(future_validation_sf, add = TRUE, col = "blue", pch = 16)
+legend("topright", legend = c("Future Validation Points"), col = "blue", pch = 16)
+####################################
+# ---- 9.1: Load Future Environmental Predictors ----
+# (Replace these file paths with your future scenario files)
+future_suitability <- raster("/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Current model/Lassa_ensemble_2024.tif")
+future_settlement  <- raster("/Users/kagboka/Desktop/Lassa modelling/NDBI/NDBI_2024.tif")
+
+# Project future rasters to match the CRS of your cases
+future_suitability <- projectRaster(future_suitability, crs = st_crs(cases_sf)$proj4string)
+future_settlement  <- projectRaster(future_settlement, crs = st_crs(cases_sf)$proj4string)
+future_settlement<-resample(future_settlement,future_suitability)
+# ---- 9.2: Stack Future Predictors and Extract Values ----
+future_stack <- stack(future_suitability, future_settlement)
+
+future_values <- getValues(future_stack)
+colnames(future_values) <- c("lyr1", "NDBI")  # Ensure these names match the training predictors
+
+# ---- 9.3: Normalize Future Data and Predict Risk Clusters ----
+complete_idx <- complete.cases(future_values)  # Identify cells with complete data
+# Initialize a vector for predictions
+future_predictions <- rep(NA, nrow(future_values))
+# Predict for complete cases using the custom predict function
+future_predictions[complete_idx] <- predict_som(
+  newdata = future_values[complete_idx, ],
+  som_model = som_model,
+  center_vals = attr(training_data_scaled, "scaled:center"),
+  scale_vals  = attr(training_data_scaled, "scaled:scale"),
+  som_clusters = som_clusters
+)
+
+# ---- 9.4: Create a Future Risk Map Raster ----
+risk_raster_future <- raster(future_stack[[1]])
+values(risk_raster_future) <- future_predictions
+
+# Optional: Apply smoothing using focal() if desired (see Step 7 for an example)
+
+# ---- 9.5: Save the Future Risk Map ----
+future_raster_path <- file.path(data_directory, "lassa_risk_future.tif")
+writeRaster(risk_raster_future, filename = future_raster_path, format = "GTiff", overwrite = TRUE)
+if (file.exists(future_raster_path)) {
+  cat("Future risk map successfully saved at:", future_raster_path, "\n")
+} else {
+  cat("Error: Future risk map was not saved correctly!\n")
+}
+
+# ---- 9.6: Visualize the Future Risk Map ----
+plot(risk_raster_future, main = "Future Lassa Fever Risk Map (Predicted via SOM Rules)")
+# ================================
+# 📌 Step 10: Extract and Visualize SOM Rules (Response Curves)
+# ================================
+# ================================
+# 📌 Step 10: Generate SOM Response Curves (Rule-Based Partial Response Plots)
+# ================================
+
+# Define a mapping from SOM cluster labels to risk probabilities.
+# Adjust these values as needed based on your interpretation of the clusters.
+risk_prob_map <- c("1" = 0.3, "2" = 0.6, "3" = 0.9)
+
+# Define a custom prediction function that uses the SOM codebook
+# to assign a risk probability for new predictor values.
+predict_risk <- function(newdata) {
+  # newdata: a data frame with columns "lyr1" and "NDBI" (unscaled)
+  # Normalize new data using the training scaling parameters
+  newdata_scaled <- scale(newdata,
+                          center = attr(training_data_scaled, "scaled:center"),
+                          scale  = attr(training_data_scaled, "scaled:scale"))
+  
+  # Use get.knnx() to find the nearest SOM node (codebook vector) for each new observation.
+  library(FNN)
+  nn_result <- get.knnx(data = som_model$codes[[1]], query = newdata_scaled, k = 1)$nn.index
+  
+  # Map each nearest node to its corresponding SOM cluster label (risk level)
+  clusters <- som_clusters[nn_result]
+  
+  # Map cluster labels to risk probabilities using our defined risk_prob_map.
+  risk_probs <- as.numeric(risk_prob_map[as.character(clusters)])
+  
+  return(risk_probs)
+}
+
+# ---- Response Curve for Predictor "lyr1" (Suitability) ----
+
+# Create a sequence covering the range of "lyr1" in the training data
+lyr1_range <- seq(min(training_data$lyr1, na.rm = TRUE),
+                  max(training_data$lyr1, na.rm = TRUE),
+                  length.out = 100)
+
+# Hold the other predictor ("NDBI") constant at its mean value (unscaled)
+mean_NDBI <- mean(training_data$NDBI, na.rm = TRUE)
+newdata_lyr1 <- data.frame(lyr1 = lyr1_range, NDBI = rep(mean_NDBI, length(lyr1_range)))
+
+# Predict risk probabilities for these new data points
+risk_response_lyr1 <- predict_risk(newdata_lyr1)
+
+# ---- Response Curve for Predictor "NDBI" (Settlement Index) ----
+
+# Create a sequence covering the range of "NDBI" in the training data
+NDBI_range <- seq(min(training_data$NDBI, na.rm = TRUE),
+                  max(training_data$NDBI, na.rm = TRUE),
+                  length.out = 100)
+
+# Hold "lyr1" constant at its mean value
+mean_lyr1 <- mean(training_data$lyr1, na.rm = TRUE)
+newdata_NDBI <- data.frame(lyr1 = rep(mean_lyr1, length(NDBI_range)), NDBI = NDBI_range)
+
+# Predict risk probabilities for these new data points
+risk_response_NDBI <- predict_risk(newdata_NDBI)
+
+# ---- Plot the Response Curves ----
+
+par(mfrow = c(1, 2))
+
+plot(lyr1_range, risk_response_lyr1, type = "l", lwd = 2, col = "red",
+     xlab = "lyr1 (Suitability)", ylab = "Risk Probability",
+     main = "Response Curve for lyr1")
+points(lyr1_range, risk_response_lyr1, col = "red", pch = 16)
+
+plot(NDBI_range, risk_response_NDBI, type = "l", lwd = 2, col = "blue",
+     xlab = "NDBI (Settlement Index)", ylab = "Risk Probability",
+     main = "Response Curve for NDBI")
+points(NDBI_range, risk_response_NDBI, col = "blue", pch = 16)
+
+par(mfrow = c(1, 1))
+

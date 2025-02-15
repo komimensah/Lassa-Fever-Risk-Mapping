@@ -1,0 +1,149 @@
+# Step 1: Load Libraries
+library(sdm)
+library(raster)
+library(dplyr)
+library(ggplot2)
+library(usdm)
+library(dismo)
+library(corrplot)
+library(dendextend)
+
+# Step 2: Clear Workspace
+rm(list = ls())
+
+pv_data <- read.csv("/Users/kagboka/Desktop/Lassa modelling/Copy of Lassa data west Africa.csv", 
+                    header = TRUE, sep = ',')
+
+spg <- subset(pv_data, select = c(long, lat))
+
+spg$species <- 1  # Add species presence column
+coordinates(spg) <- c('long', 'lat')  # Convert to spatial object
+
+# Step 4: Load and Validate Climate Data
+env_layers <- raster_stack <- stack("/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Historical model/Lassa_Variables_1980_2005.tif")
+plot(env_layers)
+# Check for alignment
+if (!all(compareRaster(env_layers, extent = TRUE, crs = TRUE))) {
+  stop("Environmental layers are not aligned.")
+}
+
+# Optional: Check CRS and inspect the first raster
+print(crs(env_layers))
+plot(env_layers[[1]])
+points(spg)
+
+# Step 5: Reduce Multicollinearity with Dendrogram
+ex <- raster::extract(env_layers, spg)
+ex_data <- as.data.frame(ex)
+
+# Calculate correlation matrix
+cor_matrix <- cor(ex_data, use = "pairwise.complete.obs", method = "pearson")
+
+# Visualize correlation matrix
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", tl.cex = 0.8)
+
+# Perform hierarchical clustering
+cor_dist <- 1 - cor_matrix  # Convert correlation to distance
+hc <- hclust(as.dist(cor_dist), method = "complete")
+dendrogram <- as.dendrogram(hc)
+
+# Plot enhanced dendrogram
+dendrogram %>%
+  color_labels(k = 5) %>%
+  set("branches_k_color", value = c("red", "green", "blue", "orange", "purple")) %>%
+  set("labels_col", value = "black") %>%
+  set("branches_lwd", value = 2) %>%
+  set("labels_cex", value = 0.8) %>%
+  plot(main = "")
+
+# Select predictors based on dendrogram
+#selected_layers <- stack(env_layers[[1]], env_layers[[2]])  # Update this with selected predictors
+# Select the specific layers by name
+selected_layers <- env_layers[["LST_Night"]]
+selected_layers <- stack(selected_layers, env_layers[["PET"]], env_layers[["EVI"]], 
+                         env_layers[["elevation"]])
+
+
+# Step 6: Prepare Data for SDM
+set.seed(234)  # For reproducibility
+d <- sdmData(species ~ ., spg, predictors = selected_layers, bg = list(method = 'gDist', n = 1000))
+
+# Step 7: Train Models Without MaxEnt
+species_model_no_maxent <- sdm(species ~ ., d, 
+                               methods = c('maxent','gam','glm'),  
+                               replication = c('cv'), 
+                               cv.folds = 3, 
+                               n = 5,
+                               parallelSetting = list(ncore = 4, method = 'parallel'))
+
+# Step 8: Evaluate Non-MaxEnt Models
+model_perf_no_maxent <- as.data.frame(getEvaluation(species_model_no_maxent))
+write.csv(model_perf_no_maxent, "/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Historical model/model_performance_no_maxent.csv", row.names = FALSE)
+
+species_model<-species_model_no_maxent
+str(species_model)
+
+
+# Step 10: Debug Ensemble Prediction
+tryCatch({
+  final_ensemble <- ensemble(
+    species_model,
+    newdata = selected_layers,
+    filename = "/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Historical model/Lassa_ensemble.tif",
+    setting = list(method = 'weighted', stat = 'tss', opt = 2),
+    overwrite = TRUE
+  )
+  
+  # Plot ensemble output
+  plot(rast(final_ensemble), main = "Final Ensemble Prediction")
+}, error = function(e) {
+  cat("Error in ensemble prediction:", e$message, "\n")
+})
+
+# Step 11: Create Binary Maps for Multiple Thresholds
+tryCatch({
+  thresholds <- c(0.5, 0.4, 0.3, 0.2, 0.1)
+  binary_dir <- "/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Historical model/binary_maps/"
+  if (!dir.exists(binary_dir)) dir.create(binary_dir)
+  
+  for (thresh in thresholds) {
+    binary_map <- rast(final_ensemble) > thresh
+    output_filename <- paste0(binary_dir, "binary_map_thresh_", gsub("\\.", "_", as.character(thresh)), ".tif")
+    writeRaster(binary_map, output_filename, overwrite = TRUE)
+    plot(binary_map, main = paste("Binary Map (Threshold >", thresh, ")"))
+  }
+}, error = function(e) {
+  cat("Error in binary map generation:", e$message, "\n")
+})
+## Alternative Scenario Prediction
+
+# Load the alternative scenario prediction stack
+alt_stack <- stack("/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Current model/Lassa_Variables_2024.tif")
+# Check the current names in your alternative stack
+print(names(alt_stack))
+
+# Rename "Elevation" to "elevation" if necessary
+names(alt_stack)[which(names(alt_stack) == "Elevation")] <- "elevation"
+
+# Verify that the names now match the model's predictor names
+print(names(alt_stack))
+# Validate CRS and alignment to ensure consistency with training data
+if (!all(compareRaster(alt_stack, extent = TRUE, crs = TRUE))) {
+  stop("Alternative scenario layers are not aligned with the training data.")
+}
+plot(alt_stack[[1]], main = "Alternative Scenario - First Layer")
+# Generate predictions over the alternative scenario stack using the predict function
+# (Assuming 'species_model' is the trained SDM object)
+predictions_alt <- predict(species_model, newdata = alt_stack, progress = "text")
+
+# Alternatively, if using an ensemble approach:
+final_ensemble_alt <- ensemble(
+  species_model,
+  newdata = alt_stack,
+  filename = "/Users/kagboka/Desktop/Lassa modelling/Stacked Variables/Current model/Lassa_ensemble_2024.tif",
+  setting = list(method = 'weighted', stat = 'tss', opt = 2),
+  overwrite = TRUE
+)
+
+# Plot the alternative scenario prediction
+plot(rast(final_ensemble_alt), main = "Predicted Risk under Alternative Scenario")
